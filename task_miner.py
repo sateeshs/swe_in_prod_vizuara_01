@@ -84,6 +84,21 @@ _TEST_FILE_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
         re.compile(r"\.Tests?/.*\.cs$"),
         re.compile(r"tests?/.*\.cs$", re.I),
     ),
+    "cpp": (
+        re.compile(r"_test\.c(?:pp)?$"),
+        re.compile(r"Test\.c(?:pp)?$"),
+        re.compile(r"test_.*\.c(?:pp)?$"),
+        re.compile(r"_tests\.c(?:pp)?$"),
+        re.compile(r"tests?/.*\.c(?:pp)?$"),
+        re.compile(r"_unittest\.c(?:pp)?$"),
+    ),
+    "fprime": (
+        re.compile(r"_test\.cpp$"),
+        re.compile(r"Test\.cpp$"),
+        re.compile(r"test_.*\.cpp$"),
+        re.compile(r"tests?/.*\.cpp$"),
+        re.compile(r"Tester\.cpp$"),
+    ),
 }
 
 # Regex to extract the file path from a "diff --git a/... b/..." header.
@@ -142,6 +157,10 @@ _RUST_TEST_FN = re.compile(
 _RUST_TEST_ATTR = re.compile(r"^\+\s*#\[(tokio::)?test\]")
 _RUST_FN_DECL = re.compile(r"^\+\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)")
 
+# C++: Google Test TEST/TEST_F/TEST_P macros and Catch2 TEST_CASE/SECTION.
+_CPP_GTEST = re.compile(r"^\+\s*TEST(?:_F|_P)?\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)")
+_CPP_CATCH2 = re.compile(r'^\+\s*TEST_CASE\s*\(\s*"([^"]+)"')
+
 # C#: [Fact], [Test], [Theory], [TestCase(...)] followed by method declaration.
 _CSHARP_TEST_ATTR = re.compile(
     r"^\+\s*\[(Fact|Test|Theory|TestCase|TestMethod)(?:\(.*?\))?\]"
@@ -192,6 +211,18 @@ def extract_test_names(test_patch: str, lang: str) -> list[str]:
                     continue  # stacked attributes like [TestCase]
                 elif not line.startswith("+"):
                     saw_test_attr = False
+
+    elif lang in ("cpp", "fprime"):
+        for line in lines:
+            # Google Test: TEST(Suite, Name) / TEST_F(Suite, Name)
+            m = _CPP_GTEST.match(line)
+            if m:
+                names.append(f"{m.group(1)}.{m.group(2)}")
+                continue
+            # Catch2: TEST_CASE("description")
+            m = _CPP_CATCH2.match(line)
+            if m:
+                names.append(m.group(1))
 
     return names
 
