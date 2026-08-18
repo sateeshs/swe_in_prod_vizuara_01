@@ -9,10 +9,14 @@ Install:
     pip install "transformers>=4.44" "datasets>=2.20" "accelerate>=0.33" "peft>=0.12" torch
     pip uninstall -y torchao     # Colab ships 0.10, below peft's floor; peft raises on it
 
-Run:
+Run (mock mode — no Docker needed):
     python swe_grpo_one_step.py
+
+Run (real Docker sandbox):
+    python swe_grpo_one_step.py --docker
 """
 
+import argparse
 import json
 import os
 import random
@@ -31,6 +35,10 @@ if not os.path.exists("utils.py"):
         "https://raw.githubusercontent.com/abgoswam/swe_in_prod_vizuara_01/main/utils.py",
         "utils.py")
 
+from docker_env import DockerEnv, reward_test
+from lang_config import EnvProtocol, build_system_prompt, get_config
+from parallel_rollouts import run_rollouts_parallel
+from rollout_logger import RolloutLogger
 from utils import NO_COMMAND, SYSTEM, MockEnv, first_bash_block, generate
 
 MODEL = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
@@ -66,15 +74,27 @@ def load_policy(device):
 
 
 def run_agent(model, tok, inst, fail_to_pass, max_turns=MAX_TURNS,
-              temperature=TEMPERATURE, sample=generate):
+              temperature=TEMPERATURE, sample=generate, env=None,
+              system_prompt=None):
     """The harness: prepare, call, parse, execute, append.
 
     One call returns one rollout -- the whole context, since in RL the
     trajectory is the training example. `max_turns` is the ONLY stopping
     condition; there is no early exit.
+
+    Parameters
+    ----------
+    env : EnvProtocol or None
+        Execution environment.  When ``None`` (default), a ``MockEnv`` is
+        created for backward compatibility.
+    system_prompt : str or None
+        Override the default system prompt (used when running with DockerEnv
+        to include language-specific commands).
     """
-    env = MockEnv(fail_to_pass)
-    context = [{"role": "system", "content": SYSTEM},
+    if env is None:
+        env = MockEnv(fail_to_pass)
+    prompt_text = system_prompt or SYSTEM
+    context = [{"role": "system", "content": prompt_text},
                {"role": "user",   "content": f"ISSUE:\n{inst['problem_statement'][:1500]}"}]
 
     for _ in range(max_turns):
@@ -85,7 +105,11 @@ def run_agent(model, tok, inst, fail_to_pass, max_turns=MAX_TURNS,
         context += [{"role": "assistant", "content": reply},
                     {"role": "user",      "content": obs[:800]}]
 
-    return dict(messages=context, patch=env.patch(), final=dict(env.fs), calls=env.calls)
+    result = dict(messages=context, patch=env.patch(), calls=env.calls)
+    # MockEnv has .fs; DockerEnv does not — include final state only when available
+    if hasattr(env, "fs"):
+        result["final"] = dict(env.fs)
+    return result
 
 
 def reward_random(patch, rng):
@@ -182,7 +206,24 @@ def grpo_step(model, tok, group, reward, device, lr=LR):
     }))
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="One GRPO step on one SWE-bench task")
+    parser.add_argument("--docker", action="store_true",
+                        help="Use real Docker sandbox instead of MockEnv")
+    parser.add_argument("--lang", default="python",
+                        help="Language config for Docker mode (default: python)")
+    parser.add_argument("--timeout", type=int, default=120,
+                        help="Per-command timeout in seconds (default: 120)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Max parallel rollouts (default: 1 = sequential)")
+    parser.add_argument("--log-dir", default="runs",
+                        help="Directory for JSONL rollout logs (default: runs/)")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
     for _opt in ["display.max_colwidth", "display.max_rows",
                  "display.max_columns", "display.width"]:
         pd.set_option(_opt, None)
@@ -194,33 +235,91 @@ def main():
 
     # 1. the task: one SWE-bench issue, and the tests that define "fixed"
     inst, fail_to_pass = load_task()
-    print(f"{inst['instance_id']}  |  {len(fail_to_pass)} tests must go red -> green")
+    task_id = inst["instance_id"]
+    print(f"{task_id}  |  {len(fail_to_pass)} tests must go red -> green")
 
     # 2. the policy: the model half of agent = model + harness
     model, tok = load_policy(device)
 
     # 3. the group: GRPO compares rollouts of the SAME task against each other,
-    #    so run the agent GROUP_SIZE times from the same prompt. Each episode
-    #    is scored the moment it ends -- that is what a real verifier does.
+    #    so run the agent GROUP_SIZE times from the same prompt.
     rng = np.random.default_rng(SEED)
-    group, reward = [], []
-    for i in range(GROUP_SIZE):
-        rollout = run_agent(model, tok, inst, fail_to_pass)
-        score = reward_random(rollout["patch"], rng)
-        group.append(rollout)
-        reward.append(score)
-        print(f"rollout {i}: {len(rollout['calls'])} commands, "
-              f"patch {'yes' if rollout['patch'] else 'no'}, reward {score}")
 
-    reward = np.array(reward)
+    if args.docker:
+        lang_cfg = get_config(args.lang)
+        patch_header = inst.get("patch", "")
+        target_file = _extract_target_file(patch_header)
+        system_prompt = build_system_prompt(lang_cfg, target_file)
+        env_mode = "docker"
+        print(f"Docker mode: {lang_cfg.name} | image: {lang_cfg.docker_image}"
+              f" | workers: {args.workers}")
+    else:
+        lang_cfg = None
+        system_prompt = None
+        env_mode = "mock"
+
+    # Build the per-rollout callable
+    def _run_one(idx: int) -> tuple[dict, float]:
+        if args.docker:
+            env = DockerEnv(
+                config=lang_cfg,
+                repo_url=inst["repo"],
+                base_commit=inst["base_commit"],
+                test_patch=inst.get("test_patch", ""),
+                timeout=args.timeout,
+            )
+            env.start()
+            try:
+                rollout = run_agent(model, tok, inst, fail_to_pass,
+                                    env=env, system_prompt=system_prompt)
+                score = reward_test(env, fail_to_pass)
+            finally:
+                env.stop()
+        else:
+            rollout = run_agent(model, tok, inst, fail_to_pass)
+            score = reward_random(rollout["patch"], rng)
+        return rollout, score
+
+    # Run rollouts (parallel when workers > 1)
+    print(f"\nRunning {GROUP_SIZE} rollouts ({args.workers} workers)...")
+    results = run_rollouts_parallel(
+        _run_one, group_size=GROUP_SIZE, max_workers=args.workers,
+    )
+
+    group = [r.rollout for r in results]
+    reward = np.array([r.reward for r in results])
+
+    # 3b. Log trajectories to JSONL
+    log_path = os.path.join(args.log_dir, f"{task_id}.jsonl")
+    with RolloutLogger(log_path) as logger:
+        for r in results:
+            logger.log(
+                r.rollout,
+                reward=r.reward,
+                task_id=task_id,
+                rollout_index=r.index,
+                env_mode=env_mode,
+                duration_s=r.duration_s,
+                extra={"model": MODEL, "temperature": TEMPERATURE,
+                       "max_turns": MAX_TURNS, "lang": args.lang},
+            )
+    print(f"Logged {len(results)} rollouts -> {log_path}")
 
     # 4. trainable parameters, needed only from here on
     model = add_lora(model)
 
     # 5. the update: rewards -> advantages -> one gradient step
     grpo_step(model, tok, group, reward, device)
-    
+
     print("done")
+
+
+def _extract_target_file(patch: str) -> str:
+    """Pull the first changed filename from a unified diff header."""
+    for line in patch.splitlines():
+        if line.startswith("+++ b/"):
+            return line[6:]
+    return "unknown_file"
 
 
 if __name__ == "__main__":
