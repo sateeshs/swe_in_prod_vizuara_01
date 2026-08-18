@@ -136,6 +136,51 @@ ANGULAR = LangConfig(
     ),
 )
 
+CPP = LangConfig(
+    name="cpp",
+    docker_image="gcc:13-bookworm",
+    build_cmd="mkdir -p build && cd build && cmake .. && make -j$(nproc)",
+    test_cmd="cd build && ctest --output-on-failure",
+    file_extensions=(".c", ".cpp", ".h", ".hpp", ".cmake"),
+    useful_commands=(
+        "ls",
+        "cat {target}",
+        'grep -rn "pattern" {target}',
+        "mkdir -p build && cd build && cmake .. && make -j$(nproc)",
+        "cd build && ctest --output-on-failure",
+        "cd build && ctest -R {test_name} --output-on-failure",
+        "cat CMakeLists.txt",
+        'find . -name "CMakeLists.txt" -o -name "*.cmake"',
+        'find . -name "*_test.cpp" -o -name "*Test.cpp"',
+    ),
+    setup_commands=(
+        "apt-get update -qq && apt-get install -y -qq cmake make git > /dev/null 2>&1",
+    ),
+)
+
+FPRIME = LangConfig(
+    name="fprime",
+    docker_image="python:3.11-slim",
+    build_cmd="fprime-util generate && fprime-util build",
+    test_cmd="fprime-util check",
+    file_extensions=(".cpp", ".hpp", ".fpp", ".py"),
+    useful_commands=(
+        "ls",
+        "cat {target}",
+        'grep -rn "pattern" {target}',
+        "fprime-util generate",
+        "fprime-util build",
+        "fprime-util check",
+        "cat CMakeLists.txt",
+        'find . -name "*.fpp" -o -name "*.cpp" -o -name "*.hpp"',
+        'grep -rn "component\\|port\\|topology" {target}',
+    ),
+    setup_commands=(
+        "pip install fprime-tools fprime-gds > /dev/null 2>&1",
+        "apt-get update -qq && apt-get install -y -qq cmake make g++ > /dev/null 2>&1",
+    ),
+)
+
 NEXTJS = LangConfig(
     name="nextjs",
     docker_image="node:22.13.1-slim",
@@ -180,6 +225,13 @@ _REGISTRY: Mapping[str, LangConfig] = {
     "nextjs": NEXTJS,
     "next": NEXTJS,
     "next.js": NEXTJS,
+    "cpp": CPP,
+    "c++": CPP,
+    "c": CPP,
+    "cmake": CPP,
+    "fprime": FPRIME,
+    "f-prime": FPRIME,
+    "f'": FPRIME,
 }
 
 

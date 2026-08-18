@@ -103,6 +103,41 @@ RUST_TOKIO_DIFF = textwrap.dedent("""\
     +}
 """)
 
+CPP_GTEST_DIFF = textwrap.dedent("""\
+    diff --git a/src/orbit.cpp b/src/orbit.cpp
+    index aaa1111..bbb2222 100644
+    --- a/src/orbit.cpp
+    +++ b/src/orbit.cpp
+    @@ -10,6 +10,7 @@ double compute_period(double semi_major) {
+    +    if (semi_major <= 0) return -1.0;
+         return 2.0 * M_PI * sqrt(pow(semi_major, 3) / MU);
+     }
+    diff --git a/tests/orbit_test.cpp b/tests/orbit_test.cpp
+    index ccc3333..ddd4444 100644
+    --- a/tests/orbit_test.cpp
+    +++ b/tests/orbit_test.cpp
+    @@ -5,6 +5,18 @@
+    +TEST(OrbitTest, NegativeSemiMajorReturnsError) {
+    +    EXPECT_EQ(compute_period(-1.0), -1.0);
+    +}
+    +
+    +TEST_F(OrbitFixture, ZeroSemiMajorReturnsError) {
+    +    EXPECT_EQ(compute_period(0.0), -1.0);
+    +}
+""")
+
+CPP_CATCH2_DIFF = textwrap.dedent("""\
+    diff --git a/tests/nav_test.cpp b/tests/nav_test.cpp
+    index aaa1111..bbb2222 100644
+    --- a/tests/nav_test.cpp
+    +++ b/tests/nav_test.cpp
+    @@ -1,3 +1,9 @@
+    +TEST_CASE("ground track wraps at antimeridian") {
+    +    auto track = compute_ground_track(iss_tle);
+    +    REQUIRE(track.wraps());
+    +}
+""")
+
 CSHARP_NUNIT_DIFF = textwrap.dedent("""\
     diff --git a/Tests/CalculatorTest.cs b/Tests/CalculatorTest.cs
     index aaa1111..bbb2222 100644
@@ -306,6 +341,50 @@ class TestExtractTestNamesCSharp:
 
     def test_empty_patch(self) -> None:
         assert extract_test_names("", "csharp") == []
+
+
+# ── C++ Diff Splitting ─────────────────────────────────────────────
+
+
+class TestSplitDiffCpp:
+    def test_separates_test_and_code(self) -> None:
+        test_patch, code_patch = split_diff(CPP_GTEST_DIFF, "cpp")
+        assert "orbit_test.cpp" in test_patch
+        assert "src/orbit.cpp" not in test_patch
+        assert "src/orbit.cpp" in code_patch
+
+    def test_catch2_test_file(self) -> None:
+        test_patch, code_patch = split_diff(CPP_CATCH2_DIFF, "cpp")
+        assert "nav_test.cpp" in test_patch
+        assert code_patch == ""
+
+
+# ── C++ Test Name Extraction ──────────────────────────────────────
+
+
+class TestExtractTestNamesCpp:
+    def test_gtest_macros(self) -> None:
+        test_patch, _ = split_diff(CPP_GTEST_DIFF, "cpp")
+        names = extract_test_names(test_patch, "cpp")
+        assert "OrbitTest.NegativeSemiMajorReturnsError" in names
+        assert "OrbitFixture.ZeroSemiMajorReturnsError" in names
+
+    def test_catch2_test_case(self) -> None:
+        names = extract_test_names(CPP_CATCH2_DIFF, "cpp")
+        assert "ground track wraps at antimeridian" in names
+
+    def test_empty_patch(self) -> None:
+        assert extract_test_names("", "cpp") == []
+
+    def test_no_test_macros(self) -> None:
+        patch = textwrap.dedent("""\
+            diff --git a/tests/orbit_test.cpp b/tests/orbit_test.cpp
+            --- a/tests/orbit_test.cpp
+            +++ b/tests/orbit_test.cpp
+            @@ -1,3 +1,4 @@
+            +// just a comment
+        """)
+        assert extract_test_names(patch, "cpp") == []
 
 
 # ── Instance ID ────────────────────────────────────────────────────

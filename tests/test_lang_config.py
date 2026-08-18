@@ -3,7 +3,9 @@
 import pytest
 
 from lang_config import (
+    CPP,
     CSHARP,
+    FPRIME,
     PYTHON,
     RUST,
     LangConfig,
@@ -29,6 +31,24 @@ class TestGetConfig:
     def test_rust_by_name(self) -> None:
         assert get_config("rust") is RUST
 
+    def test_cpp_by_name(self) -> None:
+        assert get_config("cpp") is CPP
+
+    def test_cpp_alias_c_plus_plus(self) -> None:
+        assert get_config("c++") is CPP
+
+    def test_cpp_alias_c(self) -> None:
+        assert get_config("c") is CPP
+
+    def test_cpp_alias_cmake(self) -> None:
+        assert get_config("cmake") is CPP
+
+    def test_fprime_by_name(self) -> None:
+        assert get_config("fprime") is FPRIME
+
+    def test_fprime_alias(self) -> None:
+        assert get_config("f-prime") is FPRIME
+
     def test_case_insensitive(self) -> None:
         assert get_config("Python") is PYTHON
         assert get_config("RUST") is RUST
@@ -51,11 +71,16 @@ class TestListLanguages:
         assert "python" in langs
         assert "csharp" in langs
         assert "rust" in langs
+        assert "cpp" in langs
+        assert "fprime" in langs
 
     def test_no_aliases(self) -> None:
         langs = list_languages()
         assert "dotnet" not in langs
         assert "c#" not in langs
+        assert "c++" not in langs
+        assert "cmake" not in langs
+        assert "f-prime" not in langs
 
 
 class TestLangConfigFrozen:
@@ -85,6 +110,15 @@ class TestBuildSystemPrompt:
     def test_contains_bash_fence(self) -> None:
         prompt = build_system_prompt(RUST, "main.rs")
         assert "```bash" in prompt
+
+    def test_cpp_prompt_contains_cmake(self) -> None:
+        prompt = build_system_prompt(CPP, "src/orbit.cpp")
+        assert "cmake" in prompt.lower()
+        assert "src/orbit.cpp" in prompt
+
+    def test_fprime_prompt_contains_fprime(self) -> None:
+        prompt = build_system_prompt(FPRIME, "Components/Nav/Nav.cpp")
+        assert "fprime" in prompt.lower()
 
     def test_custom_config(self) -> None:
         custom = LangConfig(
