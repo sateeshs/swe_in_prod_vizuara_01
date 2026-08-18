@@ -109,6 +109,59 @@ NODEJS = LangConfig(
     ),
 )
 
+ANGULAR = LangConfig(
+    name="angular",
+    docker_image="node:22.13.1-slim",
+    build_cmd="npx ng build",
+    test_cmd="npx ng test --watch=false --browsers=ChromeHeadless",
+    file_extensions=(".ts", ".html", ".scss", ".css", ".json"),
+    useful_commands=(
+        "ls",
+        "cat {target}",
+        'grep -rn "pattern" {target}',
+        "npx ng build",
+        "npx ng test --watch=false --browsers=ChromeHeadless",
+        "npx ng test --watch=false --include={test_name}",
+        "npx ng lint",
+        "cat angular.json",
+        "cat package.json",
+        "cat tsconfig.json",
+        'find src -name "*.module.ts" -o -name "*.component.ts"',
+        'grep -rn "loadChildren\\|loadComponent\\|Federation" src/',
+    ),
+    setup_commands=(
+        "npm install",
+        "apt-get update -qq && apt-get install -y -qq chromium > /dev/null 2>&1 || true",
+        "export CHROME_BIN=$(which chromium || which chromium-browser || echo /usr/bin/chromium)",
+    ),
+)
+
+NEXTJS = LangConfig(
+    name="nextjs",
+    docker_image="node:22.13.1-slim",
+    build_cmd="npm run build",
+    test_cmd="npm test",
+    file_extensions=(".ts", ".tsx", ".js", ".jsx", ".css", ".json"),
+    useful_commands=(
+        "ls",
+        "cat {target}",
+        'grep -rn "pattern" {target}',
+        "npm run build",
+        "npm test",
+        "npx jest {test_name}",
+        "npx vitest run {test_name}",
+        "npm run lint",
+        "cat next.config.js || cat next.config.mjs || cat next.config.ts",
+        "cat package.json",
+        "cat tsconfig.json",
+        'find app pages src -name "*.tsx" -o -name "*.ts" 2>/dev/null',
+        'grep -rn "NextFederationPlugin\\|ModuleFederationPlugin\\|remotes\\|exposes" next.config.* webpack.config.* 2>/dev/null',
+    ),
+    setup_commands=(
+        "npm install",
+    ),
+)
+
 _REGISTRY: Mapping[str, LangConfig] = {
     "python": PYTHON,
     "csharp": CSHARP,
@@ -121,6 +174,12 @@ _REGISTRY: Mapping[str, LangConfig] = {
     "js": NODEJS,
     "typescript": NODEJS,
     "ts": NODEJS,
+    "angular": ANGULAR,
+    "ng": ANGULAR,
+    "angular20": ANGULAR,
+    "nextjs": NEXTJS,
+    "next": NEXTJS,
+    "next.js": NEXTJS,
 }
 
 
@@ -141,21 +200,54 @@ def list_languages() -> Sequence[str]:
     return sorted({c.name for c in _REGISTRY.values()})
 
 
+_MFE_CONTEXT: Mapping[str, str] = {
+    "angular": (
+        "\nThis is an Angular Micro Frontend (MFE) project. Key patterns:\n"
+        "- Module Federation: check webpack.config.ts or angular.json for "
+        "exposes/remotes configuration\n"
+        "- Shared dependencies: @angular/core, @angular/common, @angular/router "
+        "are typically shared singletons\n"
+        "- Standalone components: Angular 20 uses standalone by default — "
+        "no NgModules unless legacy\n"
+        "- Signals: prefer signal(), computed(), effect() over BehaviorSubject\n"
+        "- Routing: loadComponent() for lazy standalone routes, "
+        "loadChildren() for module-based\n"
+        "- Check angular.json 'projects' for multi-project workspace layout\n"
+    ),
+    "nextjs": (
+        "\nThis is a Next.js Micro Frontend (MFE) project. Key patterns:\n"
+        "- Module Federation: check next.config.js/mjs for "
+        "NextFederationPlugin or ModuleFederationPlugin\n"
+        "- App Router (app/) vs Pages Router (pages/) — check which is used\n"
+        "- Server Components are default in app/ — add 'use client' only "
+        "when needed (hooks, browser APIs, interactivity)\n"
+        "- Shared dependencies: react, react-dom are typically shared singletons\n"
+        "- Dynamic imports: next/dynamic for client-side lazy loading\n"
+        "- Remote entry: check for remoteEntry.js references in config\n"
+        "- API routes: app/api/ (Route Handlers) or pages/api/\n"
+    ),
+}
+
+
 def build_system_prompt(config: LangConfig, target_file: str) -> str:
     """Build the agent system prompt for a given language and target file.
 
     Mirrors the structure of ``utils.SYSTEM`` but adapts the useful-commands
-    block to the language toolchain.
+    block to the language toolchain.  Includes MFE-specific context for
+    Angular and Next.js projects.
     """
     commands = "\n".join(
         f"  {cmd.format(target=target_file, test_name='TEST_NAME')}"
         for cmd in config.useful_commands
     )
 
+    mfe_section = _MFE_CONTEXT.get(config.name, "")
+
     return (
         "You are a software engineering agent. "
         f"You are in a {config.name} repository.\n"
         "Fix the bug described in the issue.\n\n"
+        f"{mfe_section}\n"
         "Respond with exactly ONE bash command per message, in a fenced block:\n\n"
         "```bash\nyour command here\n```\n\n"
         f"Useful commands:\n{commands}\n\n"

@@ -199,19 +199,31 @@ class DockerEnv:
 
 # ── test result parsing ─────────────────────────────────────────────
 
-# Patterns: "X passed", "X failed" (pytest), "Tests: X passed, Y failed"
-# (jest), "test result: ok. X passed; Y failed" (cargo), "Passed! X" /
-# "Failed! Y" (dotnet).  We look for all of them and pick the first hit.
+# Patterns for extracting pass/fail counts from test runner output.
+#
+# Supported runners:
+#   pytest:   "3 passed, 2 failed in 1.23s"
+#   jest:     "Tests:  3 passed, 1 failed, 4 total"
+#   cargo:    "test result: ok. 10 passed; 0 failed"
+#   dotnet:   "Passed!  3" / "Failed!  1"
+#   karma:    "3 specs, 1 failure" or "Executed 5 of 5 SUCCESS"
+#             or "Executed 5 of 5 (1 FAILED)"
+#   vitest:   "Tests  3 passed | 1 failed" or "3 passed (3)"
+#
 _PASS_PATTERNS = (
     re.compile(r"(\d+)\s+passed"),
     re.compile(r"Passed!\s*-?\s*(\d+)", re.I),
     re.compile(r"test result: ok\.\s*(\d+)\s+passed"),
+    re.compile(r"Executed\s+(\d+)\s+of\s+\d+\s+SUCCESS", re.I),
+    re.compile(r"(\d+)\s+specs?,\s+0\s+failures?"),
 )
 
 _FAIL_PATTERNS = (
     re.compile(r"(\d+)\s+failed"),
     re.compile(r"Failed!\s*-?\s*(\d+)", re.I),
     re.compile(r"test result:.*?(\d+)\s+failed"),
+    re.compile(r"(\d+)\s+failures?"),
+    re.compile(r"Executed\s+\d+\s+of\s+\d+\s+\((\d+)\s+FAILED\)", re.I),
 )
 
 
