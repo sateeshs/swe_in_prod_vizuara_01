@@ -37,8 +37,17 @@ if not os.path.exists("utils.py"):
 
 from docker_env import DockerEnv, reward_test
 from lang_config import EnvProtocol, build_system_prompt, get_config
+from model_config import (
+    auto_select_model,
+    detect_hardware,
+    get_model_config,
+    list_models,
+    print_hardware_summary,
+    recommend_workers,
+)
 from parallel_rollouts import run_rollouts_parallel
 from rollout_logger import RolloutLogger
+from subprocess_env import SubprocessEnv
 from utils import NO_COMMAND, SYSTEM, MockEnv, first_bash_block, generate
 
 MODEL = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
@@ -58,18 +67,43 @@ def load_task():
     return inst, json.loads(inst["FAIL_TO_PASS"])
 
 
-def load_policy(device):
+def load_policy(device, model_id=MODEL, use_4bit=False):
     """The model half of `agent = model + harness`. No adapter yet -- running
-    the agent needs no trainable parameters."""
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    the agent needs no trainable parameters.
+
+    Parameters
+    ----------
+    model_id : str
+        HuggingFace model ID.
+    use_4bit : bool
+        Load in 4-bit quantization (requires bitsandbytes).
+    """
+    tok = AutoTokenizer.from_pretrained(model_id)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL, torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        attn_implementation="sdpa").to(device)
+    load_kwargs = {"attn_implementation": "sdpa"}
 
-    print(f"{MODEL}\n{sum(p.numel() for p in model.parameters()):,} parameters, none trainable yet")
+    if use_4bit:
+        from transformers import BitsAndBytesConfig
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4",
+        )
+        load_kwargs["device_map"] = "auto"
+    else:
+        load_kwargs["torch_dtype"] = (
+            torch.float16 if device == "cuda" else torch.float32
+        )
+
+    model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+
+    if not use_4bit:
+        model = model.to(device)
+
+    print(f"{model_id} {'(4-bit)' if use_4bit else '(fp16)'}")
+    print(f"{sum(p.numel() for p in model.parameters()):,} parameters, none trainable yet")
     return model, tok
 
 
@@ -208,12 +242,28 @@ def grpo_step(model, tok, group, reward, device, lr=LR):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="One GRPO step on one SWE-bench task")
-    parser.add_argument("--docker", action="store_true",
-                        help="Use real Docker sandbox instead of MockEnv")
+
+    # Environment
+    env_group = parser.add_mutually_exclusive_group()
+    env_group.add_argument("--docker", action="store_true",
+                           help="Use Docker sandbox")
+    env_group.add_argument("--subprocess", action="store_true",
+                           help="Use subprocess sandbox (no Docker needed, works on Kaggle/Colab)")
     parser.add_argument("--lang", default="python",
-                        help="Language config for Docker mode (default: python)")
+                        help="Language config (default: python)")
     parser.add_argument("--timeout", type=int, default=120,
                         help="Per-command timeout in seconds (default: 120)")
+
+    # Model
+    parser.add_argument("--model", default=None,
+                        help=f"Model preset name or HF ID (default: auto-detect). "
+                             f"Presets: {', '.join(list_models())}")
+    parser.add_argument("--4bit", dest="use_4bit", action="store_true",
+                        help="Load model in 4-bit quantization (needs bitsandbytes)")
+    parser.add_argument("--auto", action="store_true",
+                        help="Auto-detect hardware and select best model/workers")
+
+    # Execution
     parser.add_argument("--workers", type=int, default=1,
                         help="Max parallel rollouts (default: 1 = sequential)")
     parser.add_argument("--log-dir", default="runs",
@@ -233,26 +283,50 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("device:", device)
 
+    # ── hardware detection & auto-config ─────────────────────────────
+    hw = detect_hardware()
+    print_hardware_summary(hw)
+
+    if args.auto:
+        model_cfg, use_4bit = auto_select_model(hw)
+        workers = recommend_workers(hw, model_cfg, use_4bit)
+        print(f"\nAuto-selected: {model_cfg.name} "
+              f"{'(4-bit)' if use_4bit else '(fp16)'}, "
+              f"{workers} workers")
+    else:
+        use_4bit = args.use_4bit
+        workers = args.workers
+        if args.model:
+            try:
+                model_cfg = get_model_config(args.model)
+            except KeyError:
+                # Treat as a raw HuggingFace ID
+                model_cfg = None
+        else:
+            model_cfg = None
+
+    model_id = model_cfg.hf_id if model_cfg else (args.model or MODEL)
+
     # 1. the task: one SWE-bench issue, and the tests that define "fixed"
     inst, fail_to_pass = load_task()
     task_id = inst["instance_id"]
-    print(f"{task_id}  |  {len(fail_to_pass)} tests must go red -> green")
+    print(f"\n{task_id}  |  {len(fail_to_pass)} tests must go red -> green")
 
-    # 2. the policy: the model half of agent = model + harness
-    model, tok = load_policy(device)
+    # 2. the policy
+    model, tok = load_policy(device, model_id=model_id, use_4bit=use_4bit)
 
-    # 3. the group: GRPO compares rollouts of the SAME task against each other,
-    #    so run the agent GROUP_SIZE times from the same prompt.
+    # 3. determine env mode
     rng = np.random.default_rng(SEED)
 
-    if args.docker:
+    if args.docker or args.subprocess:
         lang_cfg = get_config(args.lang)
         patch_header = inst.get("patch", "")
         target_file = _extract_target_file(patch_header)
         system_prompt = build_system_prompt(lang_cfg, target_file)
-        env_mode = "docker"
-        print(f"Docker mode: {lang_cfg.name} | image: {lang_cfg.docker_image}"
-              f" | workers: {args.workers}")
+        env_mode = "docker" if args.docker else "subprocess"
+        print(f"\n{env_mode} mode: {lang_cfg.name} | workers: {workers}")
+        if args.docker:
+            print(f"  image: {lang_cfg.docker_image}")
     else:
         lang_cfg = None
         system_prompt = None
@@ -275,15 +349,30 @@ def main():
                 score = reward_test(env, fail_to_pass)
             finally:
                 env.stop()
+        elif args.subprocess:
+            env = SubprocessEnv(
+                config=lang_cfg,
+                repo_url=inst["repo"],
+                base_commit=inst["base_commit"],
+                test_patch=inst.get("test_patch", ""),
+                timeout=args.timeout,
+            )
+            env.start()
+            try:
+                rollout = run_agent(model, tok, inst, fail_to_pass,
+                                    env=env, system_prompt=system_prompt)
+                score = reward_test(env, fail_to_pass)
+            finally:
+                env.stop()
         else:
             rollout = run_agent(model, tok, inst, fail_to_pass)
             score = reward_random(rollout["patch"], rng)
         return rollout, score
 
     # Run rollouts (parallel when workers > 1)
-    print(f"\nRunning {GROUP_SIZE} rollouts ({args.workers} workers)...")
+    print(f"\nRunning {GROUP_SIZE} rollouts ({workers} workers)...")
     results = run_rollouts_parallel(
-        _run_one, group_size=GROUP_SIZE, max_workers=args.workers,
+        _run_one, group_size=GROUP_SIZE, max_workers=workers,
     )
 
     group = [r.rollout for r in results]
@@ -300,8 +389,9 @@ def main():
                 rollout_index=r.index,
                 env_mode=env_mode,
                 duration_s=r.duration_s,
-                extra={"model": MODEL, "temperature": TEMPERATURE,
-                       "max_turns": MAX_TURNS, "lang": args.lang},
+                extra={"model": model_id, "temperature": TEMPERATURE,
+                       "max_turns": MAX_TURNS, "lang": args.lang,
+                       "use_4bit": use_4bit},
             )
     print(f"Logged {len(results)} rollouts -> {log_path}")
 
